@@ -1,0 +1,814 @@
+"""
+================================================================================
+GODZILLA ORBITAL MODEL v2.1 - VERSIÓN PRECISA
+Modelo de trading basado en energía orbital y VWAP como centro gravitacional
+================================================================================
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+from typing import Dict, Tuple, Optional, List
+from dataclasses import dataclass
+from enum import Enum
+import warnings
+import time
+import requests
+from datetime import datetime, timedelta
+warnings.filterwarnings('ignore')
+
+# =================================================================================
+# CONFIGURACIÓN DEL MODELO (OPTIMIZADA)
+# =================================================================================
+
+class OrbitalState(Enum):
+    """Estados orbitales del precio"""
+    LOW_ENERGY = "low_energy"      # Órbita estable (rango)
+    HIGH_ENERGY = "high_energy"     # Órbita elíptica (tendencia)
+    BREAKOUT = "breakout"           # Escape orbital (explosivo)
+    DECAY = "decay"                 # Decaimiento orbital (reversión)
+
+
+@dataclass
+class OrbitalConfig:
+    """Configuración del modelo orbital - VERSIÓN OPTIMIZADA"""
+    # Bollinger Bands
+    bb_period: int = 20
+    bb_std_low: float = 1.2      # K para baja energía (más estrecho)
+    bb_std_medium: float = 1.8    # K para energía media
+    bb_std_high: float = 2.2      # K para alta energía (más amplio)
+    
+    # VWAP
+    vwap_anchor: str = 'daily'    # 'daily' o 'rolling'
+    vwap_rolling_period: int = 20
+    
+    # Energía orbital (thresholds más sensibles)
+    energy_window: int = 14
+    energy_threshold_low: float = 0.4    # Baja energía
+    energy_threshold_high: float = 0.9   # Alta energía
+    energy_breakout: float = 1.5         # Breakout
+    
+    # Señales
+    min_confidence: float = 0.55
+    cooldown_hours: int = 3
+
+
+# =================================================================================
+# 1. CALCULADOR DE VWAP (PEGADO AL PRECIO)
+# =================================================================================
+
+class VWAPCalculator:
+    """
+    Calcula VWAP que sigue PEGADO al precio
+    VWAP = Σ(Precio_Típico * Volumen) / Σ(Volumen)
+    El precio típico = (High + Low + Close) / 3
+    """
+    
+    def __init__(self, config: OrbitalConfig):
+        self.config = config
+        self.last_vwaps = {}
+    
+    def calculate(self, df: pd.DataFrame, symbol: str = None) -> pd.Series:
+        """
+        Calcula VWAP que sigue la acción del precio
+        
+        Args:
+            df: DataFrame con OHLCV (ordenado cronológicamente)
+            symbol: Identificador para caché
+        
+        Returns:
+            Serie con VWAP (mismo índice que df)
+        """
+        df = df.copy()
+        
+        # Asegurar orden cronológico
+        df = df.sort_index()
+        
+        # Calcular precio típico (representativo de la vela)
+        df['typical'] = (df['High'] + df['Low'] + df['Close']) / 3
+        
+        # Producto precio típico * volumen
+        df['pv'] = df['typical'] * df['Volume']
+        
+        if self.config.vwap_anchor == 'daily':
+            # VWAP DIARIO (reinicia cada día) - ESTÁNDAR EN MERCADOS
+            df['date'] = df.index.date
+            
+            # Calcular acumulados POR DÍA (esto es clave)
+            df['cum_pv'] = df.groupby('date')['pv'].cumsum()
+            df['cum_vol'] = df.groupby('date')['Volume'].cumsum()
+            
+        else:  # rolling
+            # VWAP de ventana móvil (menos común)
+            df['cum_pv'] = df['pv'].rolling(self.config.vwap_rolling_period, min_periods=1).sum()
+            df['cum_vol'] = df['Volume'].rolling(self.config.vwap_rolling_period, min_periods=1).sum()
+        
+        # VWAP = acumulado precio*volumen / acumulado volumen
+        # Evitar división por cero
+        df['vwap'] = df['cum_pv'] / df['cum_vol'].clip(lower=0.01)
+        
+        # Limpiar columnas auxiliares
+        vwap_series = df['vwap'].copy()
+        
+        # Guardar último valor para caché
+        if symbol and not vwap_series.empty:
+            self.last_vwaps[symbol] = vwap_series.iloc[-1]
+        
+        return vwap_series
+    
+    def get_deviation(self, price: float, symbol: str = None) -> float:
+        """
+        Calcula desviación porcentual del VWAP
+        Devuelve % positivo si precio > VWAP, negativo si precio < VWAP
+        """
+        last_vwap = self.last_vwaps.get(symbol, 0)
+        if last_vwap and last_vwap > 0:
+            return ((price / last_vwap) - 1) * 100
+        return 0.0
+
+
+# =================================================================================
+# 2. CALCULADOR DE ENERGÍA ORBITAL (AHORA SIEMPRE POSITIVA)
+# =================================================================================
+
+class OrbitalEnergyCalculator:
+    """
+    Calcula la energía orbital del precio basado en física:
+    E_t = |P - VWAP| / ATR * (1 + RSI/100) * (1 + Volume_Ratio)
+    
+    AHORA CON ENERGÍA SIEMPRE POSITIVA
+    """
+    
+    def __init__(self, config: OrbitalConfig):
+        self.config = config
+        self.energy_history = {}
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Average True Range - medida de volatilidad"""
+        high_low = df['High'] - df['Low']
+        high_close = abs(df['High'] - df['Close'].shift())
+        low_close = abs(df['Low'] - df['Close'].shift())
+        
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        
+        return atr
+    
+    def calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """RSI normalizado (0-100)"""
+        delta = prices.diff()
+        gain = delta.where(delta > 0, 0).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi.fillna(50)
+    
+    def calculate(self, df: pd.DataFrame, vwap: pd.Series, symbol: str = None) -> pd.Series:
+        """
+        Calcula la energía orbital para cada punto
+        AHORA CON ENERGÍA SIEMPRE POSITIVA
+        """
+        # Distancia al centro gravitacional (normalizada)
+        distance_to_vwap = abs(df['Close'] - vwap) / vwap.clip(lower=0.01)
+        
+        # Volatilidad (ATR normalizado por precio)
+        atr = self.calculate_atr(df)
+        atr_normalized = atr / df['Close'].clip(lower=0.01)
+        
+        # RSI (momentum)
+        rsi = self.calculate_rsi(df['Close'])
+        rsi_factor = 1 + (rsi / 100)  # 1-2
+        
+        # Volumen (masa)
+        volume_ma = df['Volume'].rolling(20).mean()
+        volume_ratio = df['Volume'] / volume_ma.clip(lower=0.01)
+        volume_factor = 1 + np.log(volume_ratio.clip(lower=0.1, upper=10))
+        
+        # Energía orbital
+        denominator = atr_normalized.clip(lower=0.001)
+        energy = (distance_to_vwap / denominator) * rsi_factor * volume_factor
+        
+        # 👇 CLAVE: ENERGÍA SIEMPRE POSITIVA
+        energy = energy.abs()
+        
+        # Guardar historial
+        if symbol and not energy.empty:
+            if symbol not in self.energy_history:
+                self.energy_history[symbol] = []
+            self.energy_history[symbol].append(energy.iloc[-1])
+            self.energy_history[symbol] = self.energy_history[symbol][-100:]
+        
+        return energy
+    
+    def get_state(self, energy: float) -> Tuple[OrbitalState, float]:
+        """
+        Clasifica el estado orbital según la energía
+        """
+        if energy >= self.config.energy_breakout:
+            return OrbitalState.BREAKOUT, 1.0
+        elif energy >= self.config.energy_threshold_high:
+            return OrbitalState.HIGH_ENERGY, 0.8
+        elif energy >= self.config.energy_threshold_low:
+            return OrbitalState.LOW_ENERGY, 0.5
+        else:
+            return OrbitalState.DECAY, 0.3
+
+
+# =================================================================================
+# 3. BANDAS DE BOLLINGER ADAPTATIVAS
+# =================================================================================
+
+class AdaptiveBollingerBands:
+    """Bollinger Bands que se adaptan al estado orbital"""
+    
+    def __init__(self, config: OrbitalConfig):
+        self.config = config
+    
+    def calculate(self, df: pd.DataFrame, energy_state: OrbitalState) -> Dict:
+        """Calcula bandas adaptativas con K variable"""
+        log_prices = np.log(df['Close'].clip(lower=0.01))
+        
+        log_ma = log_prices.rolling(self.config.bb_period).mean()
+        log_std = log_prices.rolling(self.config.bb_period).std()
+        
+        # Seleccionar K según estado
+        if energy_state == OrbitalState.LOW_ENERGY:
+            k = self.config.bb_std_low
+        elif energy_state == OrbitalState.HIGH_ENERGY:
+            k = self.config.bb_std_medium
+        elif energy_state == OrbitalState.BREAKOUT:
+            k = self.config.bb_std_high * 1.2
+        else:  # DECAY
+            k = self.config.bb_std_low * 0.8
+        
+        # Convertir a escala lineal
+        middle = np.exp(log_ma)
+        upper = np.exp(log_ma + k * log_std)
+        lower = np.exp(log_ma - k * log_std)
+        
+        return {
+            'middle': middle,
+            'upper': upper,
+            'lower': lower,
+            'k_used': k,
+            'band_width': ((upper - lower) / middle) * 100
+        }
+
+
+# =================================================================================
+# 4. GENERADOR DE SEÑALES ORBITALES
+# =================================================================================
+
+class OrbitalSignalGenerator:
+    """Generador de señales basado en física orbital"""
+    
+    def __init__(self, config: OrbitalConfig = None):
+        self.config = config or OrbitalConfig()
+        self.vwap_calc = VWAPCalculator(self.config)
+        self.energy_calc = OrbitalEnergyCalculator(self.config)
+        self.bbands = AdaptiveBollingerBands(self.config)
+        
+        self.last_signals = {}
+        self.signals_history = []
+    
+    def generate(self, df: pd.DataFrame, symbol: str = "SYMBOL") -> Dict:
+        """Genera señal completa para un símbolo"""
+        if len(df) < self.config.bb_period + 10:
+            return {
+                'symbol': symbol,
+                'signal': 0,
+                'confidence': 0,
+                'state': 'INSUFFICIENT_DATA',
+                'reason': 'Datos insuficientes'
+            }
+        
+        # 1. Calcular VWAP
+        vwap = self.vwap_calc.calculate(df, symbol)
+        
+        # 2. Calcular energía orbital
+        energy = self.energy_calc.calculate(df, vwap, symbol)
+        current_energy = energy.iloc[-1] if not energy.empty else 0
+        
+        # 3. Determinar estado orbital
+        state, state_confidence = self.energy_calc.get_state(current_energy)
+        
+        # 4. Calcular bandas adaptativas
+        bands = self.bbands.calculate(df, state)
+        
+        # 5. Valores actuales
+        current_price = df['Close'].iloc[-1]
+        current_vwap = vwap.iloc[-1] if not vwap.empty else current_price
+        current_bb_upper = bands['upper'].iloc[-1]
+        current_bb_lower = bands['lower'].iloc[-1]
+        current_bb_middle = bands['middle'].iloc[-1]
+        
+        # 6. Desviaciones
+        vwap_deviation = ((current_price / current_vwap) - 1) * 100
+        bb_position = ((current_price - current_bb_lower) / 
+                      (current_bb_upper - current_bb_lower)) * 100
+        
+        # 7. GENERAR SEÑAL
+        signal = 0
+        confidence = 0
+        reason = []
+        
+        # Breakout superior
+        if current_price > current_bb_upper and state == OrbitalState.BREAKOUT:
+            signal = -2
+            confidence = min(0.9, 0.6 + current_energy * 0.15)
+            reason.append(f"BREAKOUT SUPERIOR")
+        
+        # Breakout inferior
+        elif current_price < current_bb_lower and state == OrbitalState.BREAKOUT:
+            signal = 2
+            confidence = min(0.9, 0.6 + current_energy * 0.15)
+            reason.append(f"BREAKOUT INFERIOR")
+        
+        # Alta energía + bandas
+        elif state == OrbitalState.HIGH_ENERGY:
+            if current_price >= current_bb_upper * 0.99:
+                signal = -1
+                confidence = 0.65 + min(current_energy * 0.1, 0.2)
+                reason.append(f"ALTA ENERGÍA en superior")
+            elif current_price <= current_bb_lower * 1.01:
+                signal = 1
+                confidence = 0.65 + min(current_energy * 0.1, 0.2)
+                reason.append(f"ALTA ENERGÍA en inferior")
+        
+        # Reversión desde VWAP
+        elif state == OrbitalState.LOW_ENERGY and abs(vwap_deviation) < 1.5:
+            recent_change = (current_price / df['Close'].iloc[-5] - 1) * 100
+            if recent_change < -2:
+                signal = 1
+                confidence = 0.55
+                reason.append(f"REBOTE desde VWAP")
+            elif recent_change > 2:
+                signal = -1
+                confidence = 0.55
+                reason.append(f"RECHAZO en VWAP")
+        
+        result = {
+            'symbol': symbol,
+            'timestamp': df.index[-1] if len(df) > 0 else None,
+            'signal': signal,
+            'signal_type': 'STRONG_BUY' if signal == 2 else 'BUY' if signal == 1 else
+                          'STRONG_SELL' if signal == -2 else 'SELL' if signal == -1 else 'HOLD',
+            'confidence': round(confidence, 3),
+            'state': state.value,
+            'energy': round(current_energy, 3),
+            'price': round(current_price, 2),
+            'vwap': round(current_vwap, 2),
+            'vwap_deviation': round(vwap_deviation, 2),
+            'bb_upper': round(current_bb_upper, 2),
+            'bb_lower': round(current_bb_lower, 2),
+            'reason': ' | '.join(reason) if reason else 'Sin señal'
+        }
+        
+        self.last_signals[symbol] = result
+        self.signals_history.append(result)
+        
+        return result
+
+
+# =================================================================================
+# 5. FETCHER DE DATOS MEJORADO (CON ALPACA)
+# =================================================================================
+
+def fetch_market_data(symbol: str, period: str = "5d", interval: str = "1h"):
+    """Obtiene datos de mercado (prioridad: Alpaca > yfinance)"""
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime, timedelta
+    import time
+    import requests
+    
+    print(f"🔍 Intentando obtener datos para {symbol}...")
+    
+    # ===== 1. INTENTAR CON ALPACA =====
+    try:
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        
+        try:
+            from execution.alpaca_broker import alpaca_broker
+            alpaca_available = True
+        except:
+            alpaca_available = False
+            print("⚠️ Alpaca broker no disponible")
+        
+        if alpaca_available and alpaca_broker and hasattr(alpaca_broker, 'connected') and alpaca_broker.connected:
+            print("📡 Usando Alpaca API...")
+            
+            end = datetime.now()
+            if period == "5d":
+                start = end - timedelta(days=5)
+                timeframe = "1Hour"
+            elif period == "1d":
+                start = end - timedelta(days=1)
+                timeframe = "5Min"
+            else:
+                start = end - timedelta(days=5)
+                timeframe = "1Hour"
+            
+            url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+            headers = {
+                'APCA-API-KEY-ID': alpaca_broker.api_key,
+                'APCA-API-SECRET-KEY': alpaca_broker.secret_key
+            }
+            params = {
+                'timeframe': timeframe,
+                'start': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'end': end.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'limit': 1000
+            }
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                bars = data.get('bars', [])
+                
+                if bars:
+                    df = pd.DataFrame(bars)
+                    df['timestamp'] = pd.to_datetime(df['t'])
+                    df.set_index('timestamp', inplace=True)
+                    df.rename(columns={
+                        'o': 'Open', 'h': 'High', 'l': 'Low', 
+                        'c': 'Close', 'v': 'Volume'
+                    }, inplace=True)
+                    
+                    print(f"✅ {len(df)} velas obtenidas de Alpaca")
+                    return df
+            else:
+                print(f"⚠️ Alpaca respondió con código {response.status_code}")
+    
+    except Exception as e:
+        print(f"⚠️ Error con Alpaca: {e}")
+    
+    # ===== 2. FALLBACK: yfinance =====
+    print("📡 Usando yfinance...")
+    try:
+        import yfinance as yf
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        ticker = yf.Ticker(symbol, session=session)
+        df = ticker.history(period=period, interval=interval)
+        
+        if not df.empty:
+            print(f"✅ {len(df)} velas obtenidas de yfinance")
+            return df
+    except Exception as e:
+        print(f"⚠️ yfinance falló: {e}")
+    
+    # ===== 3. DATOS SIMULADOS (solo si todo falla) =====
+    print("⚠️ Usando datos simulados (MODO PRUEBAS)")
+    dates = pd.date_range(end=datetime.now(), periods=100, freq='1h')
+    df = pd.DataFrame(index=dates)
+    np.random.seed(42)
+    base_price = 45.0
+    returns = np.random.randn(100) * 0.02
+    price = base_price * np.exp(np.cumsum(returns))
+    
+    df['Close'] = price
+    df['High'] = df['Close'] * (1 + np.abs(np.random.randn(100) * 0.01))
+    df['Low'] = df['Close'] * (1 - np.abs(np.random.randn(100) * 0.01))
+    df['Open'] = df['Close'].shift(1).fillna(df['Close'].iloc[0] * 0.99)
+    df['Volume'] = np.random.randint(1000000, 10000000, 100)
+    
+    print("⚠️ DATOS SIMULADOS - SOLO PRUEBAS")
+    return df
+
+
+# =================================================================================
+# 6. BACKTESTING RÁPIDO
+# =================================================================================
+
+def backtest_orbital_model(symbol: str, days: int = 30):
+    """
+    Backtesting rápido del modelo orbital
+    """
+    print(f"\n📊 BACKTESTING: {symbol} - {days} días")
+    print("="*60)
+    
+    # Obtener datos históricos
+    df = fetch_market_data(symbol, period=f"{days}d", interval="1h")
+    if df is None or df.empty:
+        print("❌ No hay datos para backtest")
+        return
+    
+    # Inicializar modelo
+    config = OrbitalConfig()
+    generator = OrbitalSignalGenerator(config)
+    
+    # Calcular VWAP y energía
+    df['VWAP'] = generator.vwap_calc.calculate(df, symbol)
+    df['Energy'] = generator.energy_calc.calculate(df, df['VWAP'], symbol)
+    
+    # Generar señales
+    trades = []
+    capital = 10000
+    position = 0
+    entry_price = 0
+    
+    for i in range(config.bb_period, len(df)):
+        df_window = df.iloc[:i+1].copy()
+        signal = generator.generate(df_window, symbol)
+        
+        if signal['signal'] != 0:
+            current_price = df['Close'].iloc[i]
+            
+            # Lógica simple de trading
+            if signal['signal'] > 0 and position == 0:  # COMPRA
+                position = capital / current_price
+                entry_price = current_price
+                trades.append({
+                    'type': 'BUY',
+                    'price': current_price,
+                    'time': df.index[i],
+                    'confidence': signal['confidence']
+                })
+                print(f"  COMPRA en ${current_price:.2f} ({signal['confidence']:.0%})")
+                
+            elif signal['signal'] < 0 and position > 0:  # VENTA
+                profit = (current_price - entry_price) * position
+                trades.append({
+                    'type': 'SELL',
+                    'price': current_price,
+                    'time': df.index[i],
+                    'profit': profit,
+                    'confidence': signal['confidence']
+                })
+                print(f"  VENTA en ${current_price:.2f} | Profit: ${profit:.2f}")
+                position = 0
+    
+    # Resultados
+    if trades:
+        profits = [t.get('profit', 0) for t in trades if 'profit' in t]
+        winning_trades = sum(1 for p in profits if p > 0)
+        
+        print("\n" + "="*60)
+        print("📈 RESULTADOS BACKTEST")
+        print("="*60)
+        print(f"Total trades: {len(trades)}")
+        if profits:
+            print(f"Trades ganadores: {winning_trades}/{len(profits)} ({winning_trades/len(profits)*100:.1f}%)")
+            print(f"Profit total: ${sum(profits):.2f}")
+            print(f"Profit promedio: ${np.mean(profits):.2f}")
+    
+    return trades
+
+
+# =================================================================================
+# 7. EJEMPLO DE USO COMPLETO
+# =================================================================================
+
+def run_orbital_model_example():
+    """Ejemplo completo del modelo orbital"""
+    print("="*70)
+    print("🛸 GODZILLA ORBITAL MODEL v2.1 - MODO PRECISO")
+    print("="*70)
+    
+    symbol = "TQQQ"
+    df = fetch_market_data(symbol, period="5d", interval="1h")
+    
+    if df is None or df.empty:
+        print("❌ No se pudieron obtener datos")
+        return
+    
+    print(f"\n✅ {len(df)} velas cargadas")
+    
+    # Configuración optimizada
+    config = OrbitalConfig(
+        bb_period=20,
+        bb_std_low=1.2,
+        bb_std_medium=1.8,
+        bb_std_high=2.2,
+        vwap_anchor='daily',
+        energy_threshold_low=0.4,
+        energy_threshold_high=0.9,
+        energy_breakout=1.5
+    )
+    
+    generator = OrbitalSignalGenerator(config)
+    
+    # Calcular indicadores
+    print("\n🧮 Calculando indicadores orbitales...")
+    df['VWAP'] = generator.vwap_calc.calculate(df, symbol)
+    df['Energy'] = generator.energy_calc.calculate(df, df['VWAP'], symbol)
+    
+    # Generar señales
+    all_signals = []
+    for i in range(config.bb_period, len(df)):
+        df_window = df.iloc[:i+1].copy()
+        signal = generator.generate(df_window, symbol)
+        
+        if i == len(df) - 1:
+            last_state, _ = generator.energy_calc.get_state(signal['energy'])
+            bands = generator.bbands.calculate(df_window, last_state)
+            df['BB_upper'] = bands['upper']
+            df['BB_middle'] = bands['middle']
+            df['BB_lower'] = bands['lower']
+        
+        if signal['signal'] != 0:
+            all_signals.append(signal)
+            print(f"  {signal['timestamp'].strftime('%m/%d %H:%M')}: {signal['signal_type']} "
+                  f"(conf: {signal['confidence']:.0%}) - {signal['reason']}")
+    
+    # Posición en bandas
+    if 'BB_upper' in df.columns and 'BB_lower' in df.columns:
+        df['BB_position'] = ((df['Close'] - df['BB_lower']) / 
+                            (df['BB_upper'] - df['BB_lower'])) * 100
+    
+    # Última señal
+    if all_signals:
+        last = all_signals[-1]
+        print("\n" + "="*70)
+        print("🛸 ÚLTIMA SEÑAL GENERADA")
+        print("="*70)
+        for key, value in last.items():
+            if key not in ['timestamp', 'symbol']:
+                print(f"{key:20}: {value}")
+    else:
+        print("\n⏸️ No se generaron señales")
+    
+    # Estado actual
+    print("\n" + "="*70)
+    print("📊 ESTADO ACTUAL")
+    print("="*70)
+    print(f"Precio: ${df['Close'].iloc[-1]:.2f}")
+    print(f"VWAP: ${df['VWAP'].iloc[-1]:.2f}")
+    print(f"Desviación VWAP: {((df['Close'].iloc[-1]/df['VWAP'].iloc[-1])-1)*100:.2f}%")
+    print(f"Energía Orbital: {df['Energy'].iloc[-1]:.3f}")
+    
+    # Backtesting rápido
+    backtest_orbital_model(symbol, days=10)
+    
+    return df, all_signals
+
+
+# =================================================================================
+# 8. VISUALIZADOR PROFESIONAL (VERSIÓN COMPACTA)
+# =================================================================================
+
+class OrbitalVisualizer:
+    """Visualizador profesional del modelo orbital"""
+    
+    def __init__(self, style: str = 'dark'):
+        self.style = style
+        self._setup_style()
+    
+    def _setup_style(self):
+        if self.style == 'dark':
+            plt.style.use('dark_background')
+            self.colors = {
+                'bg': '#1e1e1e', 'text': '#ffffff', 'grid': '#333333',
+                'price': '#00ff88', 'vwap': '#ffaa00',
+                'bb_upper': '#ff5555', 'bb_middle': '#888888', 'bb_lower': '#5555ff',
+                'volume_up': '#00aa00', 'volume_down': '#aa0000',
+                'signal_buy': '#00ff00', 'signal_sell': '#ff0000'
+            }
+        else:
+            plt.style.use('default')
+            self.colors = {
+                'bg': '#ffffff', 'text': '#000000', 'grid': '#dddddd',
+                'price': '#0066cc', 'vwap': '#ff9900',
+                'bb_upper': '#ff3333', 'bb_middle': '#666666', 'bb_lower': '#3333ff',
+                'volume_up': '#00cc00', 'volume_down': '#cc0000',
+                'signal_buy': '#00aa00', 'signal_sell': '#aa0000'
+            }
+    
+    def plot(self, df: pd.DataFrame, signals: List[Dict], title: str = "GODZILLA ORBITAL MODEL") -> plt.Figure:
+        """Genera gráfica profesional compacta"""
+        fig = plt.figure(figsize=(14, 8))
+        gs = fig.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.02)
+        
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+        ax3 = fig.add_subplot(gs[2])
+        ax4 = fig.add_subplot(gs[3])
+        
+        # Gráfico 1: Precio y bandas
+        if 'BB_upper' in df.columns:
+            ax1.fill_between(df.index, df['BB_lower'], df['BB_upper'], 
+                            alpha=0.1, color=self.colors['bb_middle'], zorder=1)
+            ax1.plot(df.index, df['BB_upper'], color=self.colors['bb_upper'], 
+                    linewidth=1, alpha=0.5, linestyle=':', zorder=2)
+            ax1.plot(df.index, df['BB_middle'], color=self.colors['bb_middle'], 
+                    linewidth=1, alpha=0.3, linestyle='-', zorder=2)
+            ax1.plot(df.index, df['BB_lower'], color=self.colors['bb_lower'], 
+                    linewidth=1, alpha=0.5, linestyle=':', zorder=2)
+        
+        if 'VWAP' in df.columns:
+            ax1.plot(df.index, df['VWAP'], label='VWAP', color=self.colors['vwap'], 
+                    linewidth=2.5, alpha=0.9, linestyle='-', zorder=3)
+        
+        ax1.plot(df.index, df['Close'], label='Precio', color=self.colors['price'], 
+                linewidth=2, alpha=1, zorder=4)
+        
+        for signal in signals:
+            if signal['signal'] > 0:
+                ax1.scatter(signal['timestamp'], signal['price'], color=self.colors['signal_buy'], 
+                          s=80, marker='^', zorder=5, edgecolor='white', linewidth=0.5)
+                ax1.annotate(f"{signal['signal_type']}", (signal['timestamp'], signal['price']),
+                           xytext=(5, 5), textcoords='offset points', color=self.colors['text'], 
+                           fontsize=7, bbox=dict(boxstyle='round,pad=0.2', facecolor=self.colors['signal_buy'], alpha=0.7))
+            elif signal['signal'] < 0:
+                ax1.scatter(signal['timestamp'], signal['price'], color=self.colors['signal_sell'], 
+                          s=80, marker='v', zorder=5, edgecolor='white', linewidth=0.5)
+                ax1.annotate(f"{signal['signal_type']}", (signal['timestamp'], signal['price']),
+                           xytext=(5, -10), textcoords='offset points', color=self.colors['text'], 
+                           fontsize=7, bbox=dict(boxstyle='round,pad=0.2', facecolor=self.colors['signal_sell'], alpha=0.7))
+        
+        ax1.set_ylabel('Precio ($)', color=self.colors['text'], fontsize=9)
+        ax1.legend(loc='upper left', framealpha=0.5, fontsize=7, ncol=3)
+        ax1.grid(True, alpha=0.2, color=self.colors['grid'], linewidth=0.5)
+        ax1.set_title(title, fontsize=12, fontweight='bold', color=self.colors['text'], pad=5)
+        ax1.set_xticklabels([])
+        ax1.tick_params(axis='x', length=0)
+        
+        # Gráfico 2: Volumen
+        colors_vol = []
+        for i in range(1, len(df)):
+            if df['Close'].iloc[i] >= df['Close'].iloc[i-1]:
+                colors_vol.append(self.colors['volume_up'])
+            else:
+                colors_vol.append(self.colors['volume_down'])
+        colors_vol.insert(0, self.colors['volume_up'])
+        
+        ax2.bar(df.index, df['Volume'], color=colors_vol, alpha=0.7, width=0.8)
+        ax2.set_ylabel('Volumen', color=self.colors['text'], fontsize=9)
+        ax2.grid(True, alpha=0.2, color=self.colors['grid'], linewidth=0.5)
+        
+        if 'Volume' in df.columns:
+            vol_ma = df['Volume'].rolling(20).mean()
+            ax2.plot(df.index, vol_ma, color=self.colors['vwap'], 
+                    linewidth=1, alpha=0.7, linestyle='--', label='Media 20')
+        
+        ax2.set_xticklabels([])
+        ax2.tick_params(axis='x', length=0)
+        
+        # Gráfico 3: Energía orbital
+        if 'Energy' in df.columns:
+            ax3.plot(df.index, df['Energy'], color='#ff66ff', linewidth=1.5, alpha=0.9)
+            
+            # Líneas de threshold
+            ax3.axhline(y=0.4, color=self.colors['bb_middle'], linestyle=':', alpha=0.5, linewidth=0.8, label='Low')
+            ax3.axhline(y=0.9, color=self.colors['bb_upper'], linestyle=':', alpha=0.5, linewidth=0.8, label='High')
+            ax3.axhline(y=1.5, color=self.colors['signal_sell'], linestyle=':', alpha=0.5, linewidth=0.8, label='Breakout')
+            
+            # Relleno por zonas
+            ax3.fill_between(df.index, 0, 0.4, alpha=0.1, color='#00ff00')
+            ax3.fill_between(df.index, 0.4, 0.9, alpha=0.1, color='#ffff00')
+            ax3.fill_between(df.index, 0.9, 1.5, alpha=0.1, color='#ffaa00')
+            ax3.fill_between(df.index, 1.5, df['Energy'].max(), alpha=0.15, color='#ff0000')
+        
+        ax3.set_ylabel('Energía', color=self.colors['text'], fontsize=9)
+        ax3.set_ylim(bottom=0)
+        ax3.grid(True, alpha=0.2, color=self.colors['grid'], linewidth=0.5)
+        ax3.set_xticklabels([])
+        ax3.tick_params(axis='x', length=0)
+        
+        # Gráfico 4: Posición en bandas
+        if 'BB_position' in df.columns:
+            ax4.plot(df.index, df['BB_position'], color='#00ffff', linewidth=1.5)
+            ax4.fill_between(df.index, 0, 20, alpha=0.1, color=self.colors['bb_lower'])
+            ax4.fill_between(df.index, 80, 100, alpha=0.1, color=self.colors['bb_upper'])
+            ax4.axhline(y=50, color=self.colors['bb_middle'], linestyle='--', alpha=0.5, linewidth=0.8)
+        
+        ax4.set_ylabel('Pos BB (%)', color=self.colors['text'], fontsize=9)
+        ax4.set_ylim(0, 100)
+        ax4.set_xlabel('Fecha/Hora', color=self.colors['text'], fontsize=9)
+        ax4.grid(True, alpha=0.2, color=self.colors['grid'], linewidth=0.5)
+        
+        # Formato de fechas
+        ax4.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+        ax4.tick_params(axis='x', rotation=45, colors=self.colors['text'], labelsize=8)
+        
+        for ax in [ax1, ax2, ax3]:
+            ax.tick_params(axis='y', colors=self.colors['text'], labelsize=8)
+        
+        plt.tight_layout(pad=0.5)
+        return fig
+
+
+# =================================================================================
+# 9. PUNTO DE ENTRADA
+# =================================================================================
+
+if __name__ == "__main__":
+    # Ejecutar ejemplo
+    df, signals = run_orbital_model_example()
+    
+    # Preguntar si quiere ver la gráfica
+    ver_grafica = input("\n📊 ¿Mostrar gráfica? (s/n): ").strip().lower()
+    if ver_grafica == 's':
+        visualizer = OrbitalVisualizer(style='dark')
+        fig = visualizer.plot(df, signals, "GODZILLA ORBITAL - TQQQ")
+        plt.show()

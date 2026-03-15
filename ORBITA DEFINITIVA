@@ -1,0 +1,296 @@
+"""
+PRUEBA DE NUESTRA FÓRMULA VWAP ORBITAL
+Comparación con Investing y versión mejorada
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import requests
+from datetime import datetime, timedelta
+import time
+import os
+import sys
+
+# ============================================
+# 1. FUNCIÓN PARA OBTENER DATOS
+# ============================================
+def fetch_data_alpaca(symbol, period="5d", interval="1h"):
+    """Intenta obtener datos de Alpaca"""
+    try:
+        sys.path.append('/home/kazuhira/Documentos/godzilla')
+        from execution.alpaca_broker import alpaca_broker
+        
+        if alpaca_broker and alpaca_broker.connected:
+            print("📡 Usando Alpaca API...")
+            
+            end = datetime.now()
+            start = end - timedelta(days=5)
+            timeframe = "1Hour"
+            
+            clean_symbol = symbol.replace('-USD', '')
+            
+            url = f"https://data.alpaca.markets/v2/stocks/{clean_symbol}/bars"
+            headers = {
+                'APCA-API-KEY-ID': alpaca_broker.api_key,
+                'APCA-API-SECRET-KEY': alpaca_broker.secret_key
+            }
+            params = {
+                'timeframe': timeframe,
+                'start': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'end': end.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'limit': 1000
+            }
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                bars = data.get('bars', [])
+                
+                if bars:
+                    df = pd.DataFrame(bars)
+                    df['timestamp'] = pd.to_datetime(df['t'])
+                    df.set_index('timestamp', inplace=True)
+                    df.rename(columns={
+                        'o': 'Open', 'h': 'High', 'l': 'Low', 
+                        'c': 'Close', 'v': 'Volume'
+                    }, inplace=True)
+                    print(f"✅ {len(df)} velas de Alpaca")
+                    return df
+    except Exception as e:
+        print(f"⚠️ Alpaca no disponible: {e}")
+    
+    return None
+
+def fetch_data_simulated(symbol="TQQQ"):
+    """Datos simulados para probar"""
+    print("📡 Usando datos simulados")
+    
+    np.random.seed(42)
+    periods = 100
+    dates = pd.date_range(end=datetime.now(), periods=periods, freq='1h')
+    
+    df = pd.DataFrame(index=dates)
+    
+    # Simular precio con tendencia + ondas
+    t = np.arange(periods)
+    trend = 45 + t * 0.05
+    waves = 5 * np.sin(t / 10) + 3 * np.cos(t / 5)
+    noise = np.random.randn(periods) * 0.5
+    
+    price = trend + waves + noise
+    
+    df['Close'] = price
+    df['High'] = df['Close'] * (1 + np.abs(np.random.randn(periods) * 0.01))
+    df['Low'] = df['Close'] * (1 - np.abs(np.random.randn(periods) * 0.01))
+    df['Open'] = df['Close'].shift(1).fillna(df['Close'].iloc[0] * 0.99)
+    df['Volume'] = np.random.randint(1000000, 10000000, periods)
+    
+    print(f"✅ {len(df)} velas simuladas")
+    return df
+
+# ============================================
+# 2. VWAP CLÁSICO (INVESTING)
+# ============================================
+def calculate_vwap_investing(df):
+    """VWAP como lo calcula Investing"""
+    df = df.copy()
+    df['typical'] = (df['High'] + df['Low'] + df['Close']) / 3
+    df['pv'] = df['typical'] * df['Volume']
+    df['date'] = df.index.date
+    df['cum_pv'] = df.groupby('date')['pv'].cumsum()
+    df['cum_vol'] = df.groupby('date')['Volume'].cumsum()
+    df['VWAP_investing'] = df['cum_pv'] / df['cum_vol']
+    return df['VWAP_investing']
+
+# ============================================
+# 3. NUESTRA FÓRMULA VWAP ORBITAL
+# ============================================
+def calculate_vwap_orbital(df, lambda_decay=0.2, alpha_smooth=0.2):
+    """
+    Nuestra versión mejorada
+    
+    Parámetros:
+    - lambda_decay: qué tan rápido pierden peso las velas antiguas (0.1-0.5)
+    - alpha_smooth: suavizado exponencial (0.1-0.5)
+    """
+    df = df.copy()
+    df['typical'] = (df['High'] + df['Low'] + df['Close']) / 3
+    
+    # Pesos temporales (más peso a velas recientes)
+    n = len(df)
+    weights = np.exp(-lambda_decay * np.arange(n)[::-1])
+    df['time_weight'] = weights / weights.mean()  # normalizar
+    
+    # Versión 1: Con decaimiento temporal
+    df['weighted_pv'] = df['typical'] * df['Volume'] * df['time_weight']
+    df['weighted_vol'] = df['Volume'] * df['time_weight']
+    
+    # Acumular con suavizado exponencial
+    vwap_orbital = []
+    cum_pv = 0
+    cum_vol = 0
+    
+    for i in range(len(df)):
+        # Suavizado exponencial
+        cum_pv = alpha_smooth * cum_pv + (1 - alpha_smooth) * df['weighted_pv'].iloc[i]
+        cum_vol = alpha_smooth * cum_vol + (1 - alpha_smooth) * df['weighted_vol'].iloc[i]
+        
+        vwap = cum_pv / cum_vol if cum_vol > 0 else df['typical'].iloc[i]
+        vwap_orbital.append(vwap)
+    
+    return pd.Series(vwap_orbital, index=df.index)
+
+# ============================================
+# 4. VERSIÓN ULTRA PEGADA (para pruebas extremas)
+# ============================================
+def calculate_vwap_ultra(df, reactivity=0.3):
+    """
+    Versión que sigue al precio como sombra
+    reactivity: 0.1 (lento) a 0.5 (muy rápido)
+    """
+    df = df.copy()
+    df['typical'] = (df['High'] + df['Low'] + df['Close']) / 3
+    
+    vwap = [df['typical'].iloc[0]]
+    
+    for i in range(1, len(df)):
+        # Media móvil ponderada con énfasis en el precio actual
+        weight_current = reactivity
+        weight_prev = 1 - reactivity
+        
+        vwap_current = (weight_current * df['typical'].iloc[i] + 
+                        weight_prev * vwap[-1])
+        vwap.append(vwap_current)
+    
+    return pd.Series(vwap, index=df.index)
+
+# ============================================
+# 5. PROBAR TODAS LAS VERSIONES
+# ============================================
+print("="*70)
+print("🧪 PRUEBA DE FÓRMULAS VWAP")
+print("="*70)
+
+# Obtener datos
+df = fetch_data_alpaca("TQQQ")
+if df is None:
+    df = fetch_data_simulated()
+
+print(f"\n📊 {len(df)} velas cargadas")
+
+# Calcular las diferentes versiones
+print("\n🧮 Calculando versiones de VWAP...")
+
+df['VWAP_investing'] = calculate_vwap_investing(df)
+
+# Probar diferentes parámetros
+versiones = [
+    {'name': 'Orbital Lento', 'lambda': 0.1, 'alpha': 0.3},
+    {'name': 'Orbital Balanceado', 'lambda': 0.2, 'alpha': 0.2},
+    {'name': 'Orbital Rápido', 'lambda': 0.3, 'alpha': 0.1},
+    {'name': 'Ultra Pegado', 'lambda': None, 'alpha': None}  # versión especial
+]
+
+for v in versiones:
+    if v['name'] == 'Ultra Pegado':
+        df['VWAP_ultra'] = calculate_vwap_ultra(df, reactivity=0.3)
+    else:
+        col_name = f"VWAP_{v['name'].replace(' ', '_')}"
+        df[col_name] = calculate_vwap_orbital(df, 
+                                              lambda_decay=v['lambda'], 
+                                              alpha_smooth=v['alpha'])
+
+# ============================================
+# 6. MOSTRAR RESULTADOS
+# ============================================
+print("\n" + "="*70)
+print("📊 COMPARACIÓN - ÚLTIMAS 10 VELAS")
+print("="*70)
+
+ultimas = df.tail(10)
+print(f"{'Fecha':12} {'Precio':8} {'Investing':10} {'Orbital Bal':12} {'Ultra':8} {'Diff Bal':8}")
+print("-"*70)
+
+for i in range(len(ultimas)):
+    fecha = ultimas.index[i].strftime('%m/%d %H:%M')
+    close = ultimas['Close'].iloc[i]
+    inv = ultimas['VWAP_investing'].iloc[i]
+    orb = ultimas['VWAP_Orbital_Balanceado'].iloc[i]
+    ultra = ultimas['VWAP_ultra'].iloc[i]
+    
+    diff_orb = ((close - orb) / orb) * 100
+    diff_inv = ((close - inv) / inv) * 100
+    
+    print(f"{fecha} ${close:7.2f} ${inv:8.2f} ${orb:10.2f} ${ultra:7.2f} {diff_orb:+5.1f}%")
+
+# ============================================
+# 7. ESTADÍSTICAS
+# ============================================
+print("\n" + "="*70)
+print("📈 ESTADÍSTICAS DE DESVIACIÓN")
+print("="*70)
+
+for col in df.columns:
+    if col.startswith('VWAP_'):
+        desviacion = ((df['Close'] - df[col]) / df[col]) * 100
+        print(f"\n{col}:")
+        print(f"  Desv promedio: {desviacion.mean():+.2f}%")
+        print(f"  |Desv| promedio: {desviacion.abs().mean():.2f}%")
+        print(f"  Max desviación: {desviacion.max():+.2f}%")
+        print(f"  Min desviación: {desviacion.min():+.2f}%")
+        print(f"  Correlación con precio: {df['Close'].corr(df[col]):.3f}")
+
+# ============================================
+# 8. GRAFICAR
+# ============================================
+print("\n📊 Generando gráfica comparativa...")
+
+fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
+
+# Gráfico 1: Precio + todas las versiones
+ax = axes[0]
+ax.plot(df.index, df['Close'], label='Precio', color='black', linewidth=2, alpha=0.8)
+ax.plot(df.index, df['VWAP_investing'], label='Investing', color='blue', linewidth=1.5, linestyle='--')
+ax.plot(df.index, df['VWAP_Orbital_Balanceado'], label='Orbital Balanceado', color='red', linewidth=2)
+ax.plot(df.index, df['VWAP_ultra'], label='Ultra Pegado', color='green', linewidth=1.5, linestyle=':')
+
+ax.set_ylabel('Precio ($)')
+ax.set_title('Comparación de VWAPs')
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+
+# Gráfico 2: Desviaciones
+ax = axes[1]
+for col in df.columns:
+    if col.startswith('VWAP_'):
+        desviacion = ((df['Close'] - df[col]) / df[col]) * 100
+        label = col.replace('VWAP_', '')
+        ax.plot(df.index, desviacion, label=label, linewidth=1.5, alpha=0.7)
+
+ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+ax.set_ylabel('Desviación (%)')
+ax.set_title('Desviación del precio respecto a cada VWAP')
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+
+# Gráfico 3: Diferencia entre versiones
+ax = axes[2]
+ax.plot(df.index, df['VWAP_investing'] - df['VWAP_Orbital_Balanceado'], 
+        label='Investing - Orbital', color='purple', linewidth=1.5)
+ax.plot(df.index, df['VWAP_investing'] - df['VWAP_ultra'], 
+        label='Investing - Ultra', color='orange', linewidth=1.5, alpha=0.7)
+
+ax.set_ylabel('Diferencia ($)')
+ax.set_xlabel('Fecha/Hora')
+ax.set_title('Diferencias entre versiones')
+ax.legend(loc='upper left')
+ax.grid(True, alpha=0.3)
+
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+print("\n✅ Prueba completada")

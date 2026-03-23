@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+🐉 GODZILLA ORBITAL v5 - DRAGON SELLER INTEGRADO
+================================================================================
+- Monitoreo continuo de ventas con múltiples timeframes
+- Gestión de posiciones abiertas
+- Stop Loss dinámico (basado en rebote de banda inferior + trailing ATR)
+- Ajuste de tamaño de posición por liquidez (evita slippage)
+- Señales de VENTA con confirmación multi-timeframe
+- Alertas Telegram con nivel de confianza
+- Soporte stocks (Alpaca) + crypto (Binance)
+================================================================================
+"""
+
+import numpy as np
+import pandas as pd
+import requests
+import time
+import os
+import sys
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+from dotenv import load_dotenv
+
+# ============================================
+# CONFIGURACIÓN INICIAL
+# ============================================
+load_dotenv('/home/kazuhira/Documentos/godzilla/.env')
+ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
+ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# Parámetros del bot
+SELL_THRESHOLD = 0.8          # % sobre VWAP para activar señal
+TIMEFRAMES = ['15m', '1h', '4h']   # timeframes para confirmación
+MAX_POSITION_PCT = 0.10       # % del capital por posición (10%)
+MIN_LIQUIDITY_MULTIPLIER = 0.5    # mínimo de volumen promedio para operar
+TRAILING_STOP_ATR_MULT = 2.0      # múltiplo del ATR para trailing stop
+BOLLINGER_REBOUND_PCT = 0.5       # % de rebote desde la banda inferior
+
+# Capital inicial virtual (se puede leer de Alpaca más adelante)
+VIRTUAL_CAPITAL = 100000.0
+
+print("\n" + "🐉"*60)
+print("🦖 GODZILLA ORBITAL v5 - DRAGON SELLER")
+print("🐉"*60)
+print(f"📡 Alpaca: {'✅' if ALPACA_API_KEY else '❌'}")
+print(f"📱 Telegram: {'✅' if TELEGRAM_TOKEN else '❌'}")
+print(f"🎯 Umbral venta: {SELL_THRESHOLD}%")
+print(f"⏱️ Timeframes: {', '.join(TIMEFRAMES)}")
+print(f"💰 Capital virtual: ${VIRTUAL_CAPITAL:,.2f}")
+print("🐉"*60 + "\n")
+
+# ============================================
+# FUNCIONES DE TELEGRAM
+# ============================================
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown'
+        }
+        requests.post(url, data=data, timeout=5)
+        return True
+    except:
+        return False
+
+# ============================================
+# CLASE PARA OBTENER DATOS DE MERCADO
+# ============================================
+class MarketData:
+    def __init__(self):
+        self.alpaca_key = ALPACA_API_KEY
+        self.alpaca_secret = ALPACA_SECRET_KEY
+
+    def get_stock_data(self, symbol, days=5, timeframe='1h'):
+        """Obtiene velas horarias de Alpaca"""
+        if not self.alpaca_key:
+            return None
+
+        tf_map = {'15m': '15Min', '1h': '1Hour', '4h': '1Hour'}
+        alpaca_tf = tf_map.get(timeframe, '1Hour')
+        end = datetime.now()
+        start = end - timedelta(days=days)
+
+        url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+        headers = {
+            'APCA-API-KEY-ID': self.alpaca_key,
+            'APCA-API-SECRET-KEY': self.alpaca_secret
+        }
+        params = {
+            'timeframe': alpaca_tf,
+            'start': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'end': end.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'limit': 1000
+        }
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                bars = data.get('bars', [])
+                if bars:
+                    df = pd.DataFrame(bars)
+                    df['timestamp'] = pd.to_datetime(df['t'])
+                    df.set_index('timestamp', inplace=True)
+                    df.rename(columns={
+                        'o': 'Open', 'h': 'High', 'l': 'Low',
+                        'c': 'Close', 'v': 'Volume'
+                    }, inplace=True)
+                    return df
+        except Exception:
+            pass
+        return None
+
+    def get_crypto_data(self, symbol, days=5, timeframe='1h'):
+        """Obtiene velas de Binance"""
+        symbol_map = {
+            'BTC-USD': 'BTCUSDT', 'ETH-USD': 'ETHUSDT', 'SOL-USD': 'SOLUSDT',
+            'ADA-USD': 'ADAUSDT', 'DOGE-USD': 'DOGEUSDT', 'AVAX-USD': 'AVAXUSDT'
+        }
+        binance_symbol = symbol_map.get(symbol)
+        if not binance_symbol:
+            return None
+
+        interval_map = {'15m': '15m', '1h': '1h', '4h': '4h'}
+        interval = interval_map.get(timeframe, '1h')
+
+        end_time = int(datetime.now().timestamp() * 1000)
+        start_time = end_time - days * 24 * 60 * 60 * 1000
+
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            'symbol': binance_symbol,
+            'interval': interval,
+            'startTime': start_time,
+            'endTime': end_time,
+            'limit': 500
+        }
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                df = pd.DataFrame(data, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'qa_vol', 'trades', 'taker_base', 'taker_quote', 'ignore'
+                ])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+                df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+                df.rename(columns={
+                    'open': 'Open', 'high': 'High', 'low': 'Low',
+                    'close': 'Close', 'volume': 'Volume'
+                }, inplace=True)
+                return df
+        except Exception:
+            pass
+        return None
+
+    def get_data(self, symbol, days=5, timeframe='1h'):
+        if '-USD' in symbol:
+            return self.get_crypto_data(symbol, days, timeframe)
+        else:
+            return self.get_stock_data(symbol, days, timeframe)
+
+# ============================================
+# CLASE DE INDICADORES (VWAP, BOLLINGER, ATR)
+# ============================================
+class Indicators:
+    @staticmethod
+    def vwap_orbital(df, lambda_decay=0.3, alpha_smooth=0.1):
+        """VWAP con peso temporal y suavizado (fórmula ganadora)"""
+        df = df.copy()
+        df['typical'] = (df['High'] + df['Low'] + df['Close']) / 3
+        n = len(df)
+        weights = np.exp(-lambda_decay * np.arange(n)[::-1])
+        df['time_weight'] = weights / weights.mean()
+        df['weighted_pv'] = df['typical'] * df['Volume'] * df['time_weight']
+        df['weighted_vol'] = df['Volume'] * df['time_weight']
+
+        vwap = []
+        cum_pv = df['weighted_pv'].iloc[0]
+        cum_vol = df['weighted_vol'].iloc[0]
+        vwap.append(cum_pv / cum_vol)
+
+        for i in range(1, len(df)):
+            cum_pv = alpha_smooth * cum_pv + (1 - alpha_smooth) * df['weighted_pv'].iloc[i]
+            cum_vol = alpha_smooth * cum_vol + (1 - alpha_smooth) * df['weighted_vol'].iloc[i]
+            vwap.append(cum_pv / cum_vol)
+
+        return pd.Series(vwap, index=df.index)
+
+    @staticmethod
+    def bollinger_bands(df, period=20, num_std=2.0):
+        """Bollinger Bands estándar"""
+        df = df.copy()
+        df['sma'] = df['Close'].rolling(period).mean()
+        df['std'] = df['Close'].rolling(period).std()
+        df['bb_upper'] = df['sma'] + num_std * df['std']
+        df['bb_lower'] = df['sma'] - num_std * df['std']
+        return df['bb_upper'], df['sma'], df['bb_lower']
+
+    @staticmethod
+    def atr(df, period=14):
+        """Average True Range"""
+        df = df.copy()
+        high_low = df['High'] - df['Low']
+        high_close = abs(df['High'] - df['Close'].shift())
+        low_close = abs(df['Low'] - df['Close'].shift())
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        return atr
+
+# ============================================
+# CLASE DE GESTIÓN DE RIESGOS
+# ============================================
+class RiskManager:
+    def __init__(self, capital=VIRTUAL_CAPITAL):
+        self.capital = capital
+        self.active_positions = {}  # symbol -> {'entry_price', 'quantity', 'stop_loss', 'trailing_trigger'}
+
+    def calculate_position_size(self, symbol, price, volume_avg, timeframe_volume=None):
+        """Calcula cantidad basada en liquidez y riesgo"""
+        # Volumen promedio diario en acciones (o en USDT para crypto)
+        if volume_avg is None or volume_avg <= 0:
+            return 0
+
+        # Máximo valor a invertir según porcentaje de capital
+        max_value = self.capital * MAX_POSITION_PCT
+
+        # Ajustar por liquidez: no más del 0.5% del volumen promedio diario
+        max_shares_by_liquidity = volume_avg * 0.005  # 0.5% del volumen diario
+        max_value_by_liquidity = max_shares_by_liquidity * price
+
+        # Tomar el menor de los dos
+        max_value = min(max_value, max_value_by_liquidity)
+
+        if max_value <= 0:
+            return 0
+
+        quantity = max_value / price
+        # Redondear a entero para acciones
+        if symbol and '-' not in symbol:
+            quantity = int(quantity)
+        else:
+            quantity = round(quantity, 4)  # crypto
+        return quantity
+
+    def update_trailing_stop(self, symbol, current_price):
+        """Actualiza stop loss dinámico basado en trailing ATR"""
+        pos = self.active_positions.get(symbol)
+        if not pos:
+            return None
+
+        # Necesitamos el ATR actual del símbolo (se pasa desde afuera)
+        atr_val = pos.get('atr', 0)
+        if atr_val <= 0:
+            return pos['stop_loss']
+
+        # Trailing stop: el stop se mueve hacia arriba a medida que sube el precio
+        new_stop = current_price - TRAILING_STOP_ATR_MULT * atr_val
+        if new_stop > pos['stop_loss']:
+            pos['stop_loss'] = new_stop
+        return pos['stop_loss']
+
+    def check_rebound_stop(self, symbol, current_price, bb_lower):
+        """Si el precio toca la banda inferior y rebota, ajustar stop loss"""
+        pos = self.active_positions.get(symbol)
+        if not pos:
+            return False
+
+        # Si el precio está cerca de la banda inferior (dentro del rebote %) y ha estado bajando
+        if current_price <= bb_lower * (1 + BOLLINGER_REBOUND_PCT / 100):
+            # Movemos el stop loss al punto de entrada (break even) o un poco más
+            pos['stop_loss'] = pos['entry_price']
+            return True
+        return False
+
+    def open_position(self, symbol, price, quantity, atr):
+        """Abre una nueva posición"""
+        if symbol in self.active_positions:
+            print(f"⚠️ Ya hay una posición abierta para {symbol}")
+            return False
+
+        self.active_positions[symbol] = {
+            'entry_price': price,
+            'quantity': quantity,
+            'stop_loss': price - TRAILING_STOP_ATR_MULT * atr,
+            'trailing_trigger': price,
+            'atr': atr,
+            'timestamp': datetime.now()
+        }
+        return True
+
+    def close_position(self, symbol, current_price, reason='manual'):
+        """Cierra una posición y registra P&L"""
+        pos = self.active_positions.pop(symbol, None)
+        if not pos:
+            return None
+
+        pnl = (current_price - pos['entry_price']) * pos['quantity']
+        return {
+            'symbol': symbol,
+            'entry': pos['entry_price'],
+            'exit': current_price,
+            'quantity': pos['quantity'],
+            'pnl': pnl,
+            'reason': reason
+        }
+
+    def should_close(self, symbol, current_price):
+        """Verifica si se debe cerrar por stop loss"""
+        pos = self.active_positions.get(symbol)
+        if not pos:
+            return False
+        return current_price <= pos['stop_loss']
+
+# ============================================
+# CLASE PRINCIPAL DRAGON SELLER
+# ============================================
+class DragonSeller:
+    def __init__(self):
+        self.market = MarketData()
+        self.indicators = Indicators()
+        self.risk = RiskManager()
+        self.last_alerts = {}  # symbol -> timestamp of last alert
+        self.alert_cooldown = 3600  # 1 hora entre alertas del mismo símbolo
+
+    def analyze_symbol(self, symbol):
+        """Analiza múltiples timeframes y devuelve resultado de venta"""
+        confirmations = 0
+        total_tf = len(TIMEFRAMES)
+        tf_results = {}
+
+        for tf in TIMEFRAMES:
+            df = self.market.get_data(symbol, days=2, timeframe=tf)
+            if df is None or len(df) < 20:
+                continue
+
+            # Calcular VWAP
+            df['VWAP'] = self.indicators.vwap_orbital(df)
+            price = df['Close'].iloc[-1]
+            vwap = df['VWAP'].iloc[-1]
+            deviation = ((price - vwap) / vwap) * 100
+
+            # Calcular Bollinger y ATR para el stop dinámico
+            bb_upper, bb_mid, bb_lower = self.indicators.bollinger_bands(df)
+            atr = self.indicators.atr(df).iloc[-1]
+
+            tf_results[tf] = {
+                'price': price,
+                'vwap': vwap,
+                'deviation': deviation,
+                'bb_lower': bb_lower.iloc[-1],
+                'atr': atr,
+                'volume_avg': df['Volume'].tail(20).mean()
+            }
+
+            if deviation > SELL_THRESHOLD:
+                confirmations += 1
+
+        return confirmations, total_tf, tf_results
+
+    def generate_alert(self, symbol, confirmations, total_tf, tf_results):
+        """Crea mensaje de alerta con nivel de confianza"""
+        if confirmations == 0:
+            return None, None
+
+        nivel = "BAJA"
+        emoji = "🟡"
+        if confirmations >= total_tf:
+            nivel = "ALTA"
+            emoji = "🔴"
+        elif confirmations >= total_tf // 2:
+            nivel = "MEDIA"
+            emoji = "🟠"
+
+        # Tomar datos del timeframe principal (1h)
+        principal = tf_results.get('1h', {})
+        price = principal.get('price', 0)
+        vwap = principal.get('vwap', 0)
+        deviation = principal.get('deviation', 0)
+
+        msg = f"""{emoji} *SEÑAL DE VENTA {symbol}*
+
+📊 *Confirmación:* {confirmations}/{total_tf} timeframes
+🎯 *Nivel:* {nivel}
+
+💰 Precio: ${price:.2f}
+📈 VWAP: ${vwap:.2f}
+📊 Desviación: +{deviation:.2f}%
+
+⏱️ Timeframes:
+"""
+        for tf, data in tf_results.items():
+            emoji_tf = "🔴" if data['deviation'] > SELL_THRESHOLD else "⚪"
+            msg += f"  {emoji_tf} {tf}: {data['deviation']:+.2f}%\n"
+
+        # Añadir info de riesgo si hay posición activa
+        pos = self.risk.active_positions.get(symbol)
+        if pos:
+            msg += f"\n📌 Posición activa: {pos['quantity']} @ ${pos['entry_price']:.2f}\n"
+            msg += f"🛑 Stop Loss: ${pos['stop_loss']:.2f}\n"
+
+        msg += f"\n🐉 GODZILLA ORBITAL v5\n⏰ {datetime.now().strftime('%H:%M:%S')}"
+        return msg, nivel
+
+    def manage_position(self, symbol, tf_results):
+        """Actualiza stop loss y liquidez, cierra si corresponde"""
+        pos = self.risk.active_positions.get(symbol)
+        if not pos:
+            return None
+
+        # Tomar datos del timeframe 1h para el símbolo
+        data = tf_results.get('1h', {})
+        if not data:
+            return None
+
+        current_price = data['price']
+        atr = data['atr']
+        bb_lower = data['bb_lower']
+
+        # Actualizar ATR en la posición
+        pos['atr'] = atr
+
+        # Trailing stop
+        self.risk.update_trailing_stop(symbol, current_price)
+
+        # Verificar si debe cerrar por stop loss
+        if self.risk.should_close(symbol, current_price):
+            closed = self.risk.close_position(symbol, current_price, reason='stop_loss')
+            if closed:
+                self._send_position_close_alert(closed)
+            return closed
+
+        # Revisar rebote desde la banda inferior
+        self.risk.check_rebound_stop(symbol, current_price, bb_lower)
+
+        return None
+
+    def _send_position_close_alert(self, closed):
+        msg = f"""🛑 *POSICIÓN CERRADA* {closed['symbol']}
+
+📉 Precio salida: ${closed['exit']:.2f}
+💰 P&L: ${closed['pnl']:+.2f}
+💡 Razón: {closed['reason']}
+
+🐉 GODZILLA ORBITAL v5
+⏰ {datetime.now().strftime('%H:%M:%S')}"""
+        send_telegram(msg)
+
+    def execute_sell_signal(self, symbol, confirmations, total_tf, tf_results):
+        """Ejecuta la lógica de venta (cierra posición existente o abre nueva en corto)"""
+        # Si ya hay posición, la cerramos (venta)
+        if symbol in self.risk.active_positions:
+            closed = self.risk.close_position(symbol, tf_results['1h']['price'], reason='sell_signal')
+            if closed:
+                self._send_position_close_alert(closed)
+            return True
+
+        # Aquí se podría abrir una posición en corto (short) si el broker lo permite.
+        # Por ahora solo cerramos posiciones largas.
+        return False
+
+    def run(self, symbol, interval=5):
+        print(f"\n🐉 INICIANDO DRAGON SELLER para {symbol}")
+        send_telegram(f"🐉 *DRAGON SELLER* inició monitoreo de {symbol}")
+
+        while True:
+            try:
+                confirmations, total_tf, tf_results = self.analyze_symbol(symbol)
+
+                # Gestionar posición existente (stop loss, trailing)
+                closed = self.manage_position(symbol, tf_results)
+                if closed:
+                    print(f"🔚 Posición cerrada en {symbol} con P&L ${closed['pnl']:+.2f}")
+
+                # Evaluar señal de venta
+                if confirmations > 0:
+                    alert, nivel = self.generate_alert(symbol, confirmations, total_tf, tf_results)
+                    if alert:
+                        # Evitar spam: solo si ha pasado el cooldown
+                        last_alert = self.last_alerts.get(symbol, datetime.min)
+                        if (datetime.now() - last_alert).total_seconds() > self.alert_cooldown:
+                            print("\n" + "🔴"*50)
+                            print(alert)
+                            print("🔴"*50)
+                            send_telegram(alert)
+                            self.last_alerts[symbol] = datetime.now()
+
+                            # Ejecutar venta si la señal es ALTA y tenemos posición
+                            if nivel == "ALTA" and symbol in self.risk.active_positions:
+                                self.execute_sell_signal(symbol, confirmations, total_tf, tf_results)
+                else:
+                    print(f"\n⚪ {datetime.now().strftime('%H:%M:%S')} - Sin señales de venta")
+
+                # Esperar
+                time.sleep(interval * 60)
+
+            except KeyboardInterrupt:
+                print("\n🛑 Monitoreo detenido")
+                send_telegram("🛑 *DRAGON SELLER* detuvo el monitoreo")
+                break
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                time.sleep(60)
+
+    def demo_trade(self, symbol):
+        """Simula una compra manual para probar gestión de posición"""
+        # Obtener precio actual
+        df = self.market.get_data(symbol, days=1, timeframe='1h')
+        if df is None:
+            print("No se pudo obtener precio")
+            return
+        price = df['Close'].iloc[-1]
+
+        # Calcular volumen promedio y ATR
+        volume_avg = df['Volume'].tail(20).mean()
+        atr = self.indicators.atr(df).iloc[-1]
+
+        # Calcular cantidad
+        quantity = self.risk.calculate_position_size(symbol, price, volume_avg)
+        if quantity == 0:
+            print("No se puede abrir posición por falta de liquidez")
+            return
+
+        # Abrir posición
+        if self.risk.open_position(symbol, price, quantity, atr):
+            print(f"✅ Posición abierta: {symbol} {quantity} @ ${price:.2f}")
+            send_telegram(f"✅ *POSICIÓN ABIERTA* {symbol}\nCantidad: {quantity}\nPrecio: ${price:.2f}")
+        else:
+            print("Ya hay una posición abierta")
+
+# ============================================
+# MENÚ PRINCIPAL
+# ============================================
+if __name__ == "__main__":
+    seller = DragonSeller()
+
+    while True:
+        print("\n" + "="*70)
+        print("🐉 GODZILLA ORBITAL v5 - MENÚ PRINCIPAL")
+        print("="*70)
+        print("1. TQQQ (Nasdaq 3x)")
+        print("2. SPY (S&P 500)")
+        print("3. BTC-USD (Bitcoin)")
+        print("4. ETH-USD (Ethereum)")
+        print("5. SOL-USD (Solana)")
+        print("6. NVDA (NVIDIA)")
+        print("\nM. Modo monitoreo (ingresar símbolo)")
+        print("P. Prueba rápida (una vez)")
+        print("X. Salir")
+
+        opcion = input("\nElige opción: ").strip().upper()
+
+        if opcion == 'X':
+            print("👋 ¡Hasta luego!")
+            break
+
+        elif opcion == 'M':
+            sym = input("Símbolo (ej: TQQQ, BTC-USD): ").strip().upper()
+            if not sym:
+                continue
+            intervalo = input("Intervalo (minutos, default 5): ").strip()
+            intervalo = int(intervalo) if intervalo.isdigit() else 5
+            seller.run(sym, intervalo)
+
+        elif opcion == 'P':
+            sym = input("Símbolo: ").strip().upper()
+            if sym:
+                # Ejecuta un análisis único
+                conf, total, tf_res = seller.analyze_symbol(sym)
+                if conf > 0:
+                    alert, nivel = seller.generate_alert(sym, conf, total, tf_res)
+                    print(alert)
+                else:
+                    print("⚪ Sin señales de venta")
+
+        elif opcion == '1':
+            seller.run('TQQQ', 5)
+        elif opcion == '2':
+            seller.run('SPY', 5)
+        elif opcion == '3':
+            seller.run('BTC-USD', 5)
+        elif opcion == '4':
+            seller.run('ETH-USD', 5)
+        elif opcion == '5':
+            seller.run('SOL-USD', 5)
+        elif opcion == '6':
+            seller.run('NVDA', 5)
+        else:
+            print("❌ Opción no válida")

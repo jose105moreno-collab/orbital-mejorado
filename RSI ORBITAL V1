@@ -1,0 +1,18 @@
+typical = (High + Low + Close) / 3
+
+Δ = typical_t - typical_{t-1}
+gain = max(Δ, 0)
+loss = -min(Δ, 0)
+
+vol_factor = volume_t / average_volume(period)
+
+gain_ema = α * gain * vol_factor + (1-α) * gain_ema_{t-1}
+loss_ema = α * loss * vol_factor + (1-α) * loss_ema_{t-1}
+
+RS = gain_ema / loss_ema
+RSI_orbital = 100 - (100 / (1 + RS))
+# Dentro del loop de timeframes, después de calcular VWAP:
+rsi = self.indicators.rsi_orbital(df, period=10, volume_weight=True).iloc[-1]
+# Podemos usarlo para filtrar señales:
+# - Si RSI > 70, sobrecompra, refuerza señal de venta.
+# - Si RSI < 30, sobreventa, anula señal de venta.

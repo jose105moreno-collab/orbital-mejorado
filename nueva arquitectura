@@ -1,0 +1,17 @@
+godzilla/
+│
+├── data/                          # datos (puedes guardar CSVs o tener un módulo descarga)
+├── strategies/                    # estrategias individuales
+│   └── mean_reversion_v6.py       # tu estrategia V6 en forma de clase
+├── backtest/                      # motor de backtest
+│   └── engine.py
+├── portfolio/                     # asignación de capital multi‑activo
+│   └── allocator.py
+├── analysis/                      # métricas de rendimiento
+│   └── metrics.py
+├── validation/                    # walk‑forward, Monte Carlo, etc.
+│   └── walk_forward.py
+├── execution/                     # opcional: conexión con broker (Alpaca)
+│   └── alpaca_executor.py
+├── main.py                        # orquestador principal
+└── requirements.txt

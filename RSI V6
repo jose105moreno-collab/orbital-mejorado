@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Estrategia Diaria "Nivel Dios" – Versión 6
+- Score ponderado (BB peso 2, resto 1)
+- Filtro de confirmación: close > SMA5 (corto plazo)
+- Filtro de bandwidth comprimido (evita tendencias fuertes)
+- Trailing adaptativo según profit en ATR
+- Evita clusters de precios (no repetir entrada cerca)
+- Expectativa por trade
+- Optimización de frecuencia (score_threshold flexible)
+- Mejoras en posición dinámica y trailing
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+import warnings
+import time
+import os
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+warnings.filterwarnings('ignore')
+
+# ============================================
+# CARGAR VARIABLES DE ENTORNO (API KEYS)
+# ============================================
+load_dotenv('/home/kazuhira/Documentos/godzilla/.env')
+ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
+ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
+
+# ============================================
+# INDICADORES (optimizados)
+# ============================================
+def bollinger_bands(df, period=20, std=2):
+    df = df.copy()
+    df['sma'] = df['Close'].rolling(period).mean()
+    df['std'] = df['Close'].rolling(period).std()
+    df['bb_upper'] = df['sma'] + std * df['std']
+    df['bb_lower'] = df['sma'] - std * df['std']
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma']
+    return df
+
+def connors_rsi(df, rsi_period=3, streak_period=2, roc_period=100):
+    df = df.copy()
+    close = df['Close']
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/rsi_period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/rsi_period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi_3 = 100 - (100 / (1 + rs))
+
+    direction = np.sign(close.diff())
+    streak = []
+    streak_val = 0
+    for i in range(len(df)):
+        if i == 0:
+            streak_val = 0
+        else:
+            if direction.iloc[i] == direction.iloc[i-1]:
+                streak_val += direction.iloc[i]
+            else:
+                streak_val = direction.iloc[i]
+        streak.append(streak_val)
+    df['streak'] = streak
+    delta_s = df['streak'].diff()
+    gain_s = delta_s.clip(lower=0)
+    loss_s = (-delta_s).clip(lower=0)
+    avg_gain_s = gain_s.ewm(alpha=1/streak_period, adjust=False).mean()
+    avg_loss_s = loss_s.ewm(alpha=1/streak_period, adjust=False).mean()
+    rs_s = avg_gain_s / avg_loss_s
+    rsi_streak = 100 - (100 / (1 + rs_s))
+
+    roc = close.pct_change() * 100
+    def percent_rank(arr):
+        current = arr[-1]
+        return (arr < current).sum() / len(arr) * 100
+    percent_rank_series = roc.rolling(roc_period).apply(percent_rank, raw=True)
+    percent_rank_series = percent_rank_series.fillna(50)
+
+    crsi = (rsi_3 + rsi_streak + percent_rank_series) / 3
+    return crsi.fillna(50)
+
+def hurst_exponent(series, max_lag=20):
+    series = series.dropna().values
+    if len(series) < max_lag:
+        return 0.5
+    lags = range(2, min(max_lag, len(series)//2))
+    tau = [np.sqrt(np.std(np.subtract(series[lag:], series[:-lag]))) for lag in lags]
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0] * 2.0
+
+def atr(df, period=14):
+    high_low = df['High'] - df['Low']
+    high_close = abs(df['High'] - df['Close'].shift())
+    low_close = abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def sma(df, period):
+    return df['Close'].rolling(period).mean()
+
+# ============================================
+# OBTENER DATOS (DIARIOS) - ALPACA, BINANCE, YFINANCE
+# ============================================
+def get_daily_data(symbol, period="2y"):
+    print(f"📥 Descargando datos diarios de {symbol}...")
+    for intento in range(3):
+        try:
+            import yfinance as yf
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+            ticker = yf.Ticker(symbol, session=session)
+            df = ticker.history(period=period, interval="1d")
+            if not df.empty:
+                print(f"✅ {len(df)} velas diarias de yfinance")
+                return df
+            print(f"⚠️ Intento {intento+1}: datos vacíos")
+        except Exception as e:
+            print(f"⚠️ Intento {intento+1} falló: {e}")
+        time.sleep(2 ** intento)
+
+    if '-USD' not in symbol and ALPACA_API_KEY:
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=730)
+            url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+            headers = {
+                'APCA-API-KEY-ID': ALPACA_API_KEY,
+                'APCA-API-SECRET-KEY': ALPACA_SECRET_KEY
+            }
+            params = {
+                'timeframe': '1Day',
+                'start': start.strftime('%Y-%m-%d'),
+                'end': end.strftime('%Y-%m-%d'),
+                'limit': 1000
+            }
+            r = requests.get(url, headers=headers, params=params, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                bars = data.get('bars', [])
+                if bars:
+                    df = pd.DataFrame(bars)
+                    df['timestamp'] = pd.to_datetime(df['t'])
+                    df.set_index('timestamp', inplace=True)
+                    df.rename(columns={'o':'Open','h':'High','l':'Low','c':'Close','v':'Volume'}, inplace=True)
+                    print(f"✅ {len(df)} velas diarias de Alpaca")
+                    return df
+        except Exception as e:
+            print(f"⚠️ Error con Alpaca: {e}")
+
+    if '-USD' in symbol:
+        symbol_map = {
+            'BTC-USD': 'BTCUSDT', 'ETH-USD': 'ETHUSDT', 'SOL-USD': 'SOLUSDT',
+            'ADA-USD': 'ADAUSDT', 'DOGE-USD': 'DOGEUSDT', 'AVAX-USD': 'AVAXUSDT'
+        }
+        binance_symbol = symbol_map.get(symbol)
+        if binance_symbol:
+            try:
+                end_time = int(datetime.now().timestamp() * 1000)
+                start_time = end_time - 730 * 24 * 60 * 60 * 1000
+                url = "https://api.binance.com/api/v3/klines"
+                params = {
+                    'symbol': binance_symbol,
+                    'interval': '1d',
+                    'startTime': start_time,
+                    'endTime': end_time,
+                    'limit': 1000
+                }
+                r = requests.get(url, params=params, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    df = pd.DataFrame(data, columns=[
+                        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                        'close_time', 'qa_vol', 'trades', 'taker_base', 'taker_quote', 'ignore'
+                    ])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+                    df.rename(columns={'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'}, inplace=True)
+                    print(f"✅ {len(df)} velas diarias de Binance")
+                    return df
+            except Exception as e:
+                print(f"⚠️ Error con Binance: {e}")
+
+    print("❌ No se obtuvieron datos reales. Usando datos simulados...")
+    np.random.seed(42)
+    dates = pd.date_range(end=datetime.now(), periods=500, freq='D')
+    df = pd.DataFrame(index=dates)
+    price = 100 + np.cumsum(np.random.randn(500) * 0.5)
+    df['Close'] = price
+    df['High'] = price * (1 + np.abs(np.random.randn(500)*0.02))
+    df['Low']  = price * (1 - np.abs(np.random.randn(500)*0.02))
+    df['Open'] = price * (1 + np.random.randn(500)*0.01)
+    df['Volume'] = np.random.randint(1e6, 5e6, 500)
+    return df
+
+# ============================================
+# FUNCIONES AUXILIARES (INDICADORES AVANZADOS)
+# ============================================
+def add_indicators(df):
+    df = bollinger_bands(df)
+    df['CRSI'] = connors_rsi(df)
+    df['ATR'] = atr(df)
+    df['SMA50'] = sma(df, 50)
+    df['SMA5']  = sma(df, 5)               # confirmación corto plazo
+    df['hurst'] = df['Close'].rolling(30).apply(lambda x: hurst_exponent(x, max_lag=20), raw=False)
+    df['trend_strength'] = df['Close'].rolling(20).mean() - df['Close'].rolling(50).mean()
+    return df
+
+def kill_switch(df, lookback=5, drop_pct=0.10, max_volatility=0.05):
+    """Kill switch unificado: True = se puede operar"""
+    df['max_drop'] = (df['Close'] / df['Close'].shift(lookback) - 1) * 100
+    df['volatility'] = df['ATR'] / df['Close']
+    kill = (
+        (df['max_drop'] < -drop_pct * 100) |
+        (df['volatility'] > max_volatility)
+    )
+    kill_shifted = kill.rolling(window=10, min_periods=1).max().fillna(0).astype(bool)
+    return ~kill_shifted
+
+def score_entry(df, crsi_thresh_percentile=10, hurst_thresh=0.5):
+    """
+    Score ponderado:
+    - precio < bb_lower: +2
+    - crsi < percentil (10% más bajo): +1
+    - hurst < hurst_thresh: +1
+    - vela verde + momentum (close > open & close > close.shift(1)): +1
+    - trend_strength > 0: +1 (opcional)
+    - close > SMA5 (confirmación corto plazo): +1
+    """
+    # CRSI dinámico (percentil 10% más bajo de los últimos 100 días)
+    crsi_thresh = df['CRSI'].rolling(100, min_periods=50).quantile(crsi_thresh_percentile/100).fillna(50)
+    
+    score = 0
+    score += (df['Close'] < df['bb_lower']).astype(int) * 2
+    score += (df['CRSI'] < crsi_thresh).astype(int)
+    score += (df['hurst'] < hurst_thresh).astype(int)
+    momentum = (df['Close'] > df['Open']) & (df['Close'] > df['Close'].shift(1))
+    score += momentum.astype(int)
+    score += (df['trend_strength'] > 0).astype(int)   # tendencia alcista ayuda
+    score += (df['Close'] > df['SMA5']).astype(int)   # confirmación corto plazo
+
+    # Filtro de bandwidth: no operar si bandas muy anchas (evita tendencias)
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma']
+    # Excluir si bandwidth > percentil 90 de su propia historia
+    bandwidth_thresh = df['bb_width'].rolling(100, min_periods=50).quantile(0.90)
+    bandwidth_ok = (df['bb_width'] <= bandwidth_thresh)
+    # No sumamos, sino que luego se usa como filtro duro
+    return score, bandwidth_ok
+
+def get_dynamic_trailing(profit_atr):
+    """Trailing adaptativo según beneficio en múltiplos de ATR"""
+    if profit_atr > 3.0:
+        return 0.7   # muy ajustado
+    elif profit_atr > 2.0:
+        return 1.0
+    elif profit_atr > 1.0:
+        return 1.2
+    else:
+        return 1.5   # inicial
+
+# ============================================
+# MOTOR DE BACKTEST (VERSIÓN 6)
+# ============================================
+def backtest(symbol, capital_inicial=100000, risk_per_trade_base=0.01,
+             stop_atr_mult=2.0, trailing_atr_mult_initial=1.5,
+             kill_switch_days=5, kill_drop=0.10, kill_vol=0.05,
+             hurst_thresh=0.5, crsi_percentile=10,
+             score_threshold=3,        # ahora con más componentes, ajustamos
+             use_partial_exit=True, partial_pct=0.5,
+             max_exposure_pct=0.3,     # máximo 30% del capital en un trade
+             min_distance_to_band=0.01,  # requerimos desviación mínima
+             cooldown_bars=3,          # días entre trades
+             price_cluster_atr=0.5,    # evitar entrada similar
+             comision=0.001, slippage=0.001, debug=False):
+    """
+    Backtest con todas las mejoras de la V6.
+    """
+    df = get_daily_data(symbol)
+    if df.empty:
+        print("❌ No se pudieron obtener datos")
+        return None, None
+
+    df = add_indicators(df)
+    df['can_trade'] = kill_switch(df, kill_switch_days, kill_drop, kill_vol)
+
+    # Calcular score y filtro de bandwidth
+    score_series, bandwidth_ok = score_entry(df, crsi_percentile, hurst_thresh)
+    df['score'] = score_series
+    df['entry'] = (df['score'] >= score_threshold) & df['can_trade'] & bandwidth_ok
+
+    # Añadir filtro de distancia mínima a la banda
+    df['band_distance'] = (df['bb_lower'] - df['Close']) / df['Close']
+    df['band_ok'] = df['band_distance'] > min_distance_to_band
+
+    # Combinar con el entry (solo si hay distancia)
+    df['entry'] = df['entry'] & df['band_ok']
+
+    # Régimen de volatilidad para position sizing (percentiles)
+    vol_percentile = df['ATR'] / df['Close']
+    vol_rank = vol_percentile.rolling(100, min_periods=50).rank(pct=True).fillna(0.5)
+    df['vol_factor'] = np.where(vol_rank < 0.3, 1.0,
+                                np.where(vol_rank < 0.7, 0.75, 0.5))
+
+    df['hurst_factor'] = np.where(df['hurst'] < 0.3, 1.5,
+                                  np.where(df['hurst'] < 0.45, 1.0, 0.5))
+
+    if debug:
+        print("\n🔍 DIAGNÓSTICO DE CONDICIONES (V6):")
+        print(f"Total velas: {len(df)}")
+        print(f"Días operables (kill): {df['can_trade'].sum()}")
+        print(f"Bandwidth OK: {bandwidth_ok.sum()}")
+        print(f"Distancia a banda OK: {df['band_ok'].sum()}")
+        print(f"Entradas potenciales (score >= {score_threshold}): {df['entry'].sum()}")
+        if df['entry'].any():
+            print(f"Score promedio en entradas: {df[df['entry']]['score'].mean():.2f}")
+        else:
+            print("Ninguna entrada")
+
+    # Variables de simulación
+    capital = capital_inicial
+    position = 0
+    entry_price = 0
+    entry_atr = 0
+    stop_loss = 0
+    highest_price = 0
+    trailing_mult = trailing_atr_mult_initial
+    trades = []
+    equity = [capital]
+    consecutive_losses = 0
+    max_consecutive_losses = 0
+    last_trade_idx = -100
+    last_entry_price = 0
+
+    for i in range(60, len(df)):
+        price = df['Close'].iloc[i]
+        low = df['Low'].iloc[i]
+        atr_val = df['ATR'].iloc[i]
+        bb_mid = df['sma'].iloc[i]
+        crsi = df['CRSI'].iloc[i]
+
+        # Actualizar equity
+        current_equity = capital + (position * price if position > 0 else 0)
+        equity.append(current_equity)
+
+        # === SIN POSICIÓN: BUSCAR ENTRADA ===
+        if position == 0 and df['entry'].iloc[i]:
+            # Cooldown (evitar cluster)
+            if i - last_trade_idx < cooldown_bars:
+                continue
+            # Evitar entrada si el precio es muy similar a la última entrada (cluster)
+            if abs(price - last_entry_price) / (atr_val * price_cluster_atr) < 0.5 and last_entry_price > 0:
+                continue
+
+            # Position sizing dinámico
+            risk_pct = risk_per_trade_base * df['hurst_factor'].iloc[i] * df['vol_factor'].iloc[i]
+            risk_amount = capital * risk_pct
+            stop_distance = stop_atr_mult * atr_val
+            if stop_distance <= 0:
+                continue
+            quantity = risk_amount / stop_distance
+            if quantity <= 0:
+                continue
+
+            # Limitar exposición máxima
+            max_exposure_value = capital * max_exposure_pct
+            if entry_price * quantity > max_exposure_value:
+                quantity = max_exposure_value / entry_price
+
+            entry_price = price * (1 + slippage)
+            stop_loss = entry_price - stop_atr_mult * atr_val
+            highest_price = entry_price
+            trailing_mult = trailing_atr_mult_initial
+
+            capital -= entry_price * quantity
+            position = quantity
+
+            trades.append({
+                'fecha': df.index[i],
+                'tipo': 'COMPRA',
+                'precio': entry_price,
+                'cantidad': quantity,
+                'stop_loss': stop_loss,
+                'trailing_mult': trailing_mult,
+                'crsi': crsi,
+                'hurst': df['hurst'].iloc[i],
+                'score': df['score'].iloc[i]
+            })
+            last_trade_idx = i
+            last_entry_price = entry_price
+            continue
+
+        # === CON POSICIÓN: VERIFICAR SALIDAS ===
+        if position > 0:
+            # Actualizar highest price
+            if price > highest_price:
+                highest_price = price
+                # Trailing adaptativo según beneficio
+                profit_atr = (highest_price - entry_price) / atr_val
+                trailing_mult = get_dynamic_trailing(profit_atr)
+                stop_loss = highest_price - trailing_mult * atr_val
+
+            exit_price = None
+            exit_reason = None
+            exit_quantity = 0
+
+            # 1. Stop loss fijo
+            if low <= stop_loss:
+                exit_price = stop_loss * (1 - slippage)
+                exit_reason = 'stop_loss'
+                exit_quantity = position
+            # 2. Take profit en media de Bollinger (parcial o total)
+            elif price >= bb_mid:
+                if use_partial_exit:
+                    exit_price = price * (1 - slippage)
+                    exit_reason = 'take_profit (parcial)'
+                    exit_quantity = position * partial_pct
+                else:
+                    exit_price = price * (1 - slippage)
+                    exit_reason = 'take_profit'
+                    exit_quantity = position
+            # 3. Salida por CRSI sobrecomprado (venta total)
+            elif crsi > 70:
+                exit_price = price * (1 - slippage)
+                exit_reason = 'crsi_exit'
+                exit_quantity = position
+
+            if exit_price is not None and exit_quantity > 0:
+                # Costes de comisión
+                cost = exit_price * exit_quantity * comision
+                pnl = (exit_price - entry_price) * exit_quantity - cost
+                capital += exit_price * exit_quantity - cost
+                position -= exit_quantity
+
+                trades.append({
+                    'fecha': df.index[i],
+                    'tipo': 'VENTA',
+                    'precio': exit_price,
+                    'cantidad': exit_quantity,
+                    'pnl': pnl,
+                    'razon': exit_reason,
+                    'crsi': crsi
+                })
+
+                if position == 0:
+                    entry_price = 0
+                    stop_loss = 0
+                    highest_price = 0
+                    trailing_mult = trailing_atr_mult_initial
+
+        # Actualizar pérdidas consecutivas
+        if trades and trades[-1]['tipo'] == 'VENTA':
+            pnl_last = trades[-1]['pnl']
+            if pnl_last < 0:
+                consecutive_losses += 1
+                max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+            else:
+                consecutive_losses = 0
+
+    # Cerrar posición si queda abierta al final
+    if position > 0:
+        exit_price = df['Close'].iloc[-1] * (1 - slippage)
+        cost = exit_price * position * comision
+        pnl = (exit_price - entry_price) * position - cost
+        capital += exit_price * position - cost
+        trades.append({
+            'fecha': df.index[-1],
+            'tipo': 'CIERRE',
+            'precio': exit_price,
+            'cantidad': position,
+            'pnl': pnl,
+            'razon': 'end_of_data'
+        })
+        position = 0
+
+    # Métricas finales
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        print("⚠️ No se generaron trades.")
+        return df, trades_df
+
+    exits = trades_df[trades_df['tipo'].isin(['VENTA', 'CIERRE'])]
+    if exits.empty:
+        print("⚠️ No hay operaciones cerradas.")
+        return df, trades_df
+
+    pnls = exits['pnl'].values
+    ganadoras = (pnls > 0).sum()
+    num_trades = len(pnls)
+    win_rate = ganadoras / num_trades * 100 if num_trades > 0 else 0
+    avg_win = pnls[pnls > 0].mean() if ganadoras > 0 else 0
+    avg_loss = pnls[pnls < 0].mean() if (num_trades - ganadoras) > 0 else 0
+    profit_factor = pnls[pnls > 0].sum() / abs(pnls[pnls < 0].sum()) if (pnls[pnls < 0].sum() != 0) else np.inf
+    expectancy = np.mean(pnls) if len(pnls) > 0 else 0
+    expectancy_by_risk = expectancy / (capital_inicial * risk_per_trade_base) if risk_per_trade_base > 0 else 0
+
+    # Equity curve y drawdown
+    equity_series = pd.Series(equity)
+    returns = equity_series.pct_change().dropna()
+    sharpe = returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0
+    peak = equity_series.expanding().max()
+    drawdown = (peak - equity_series) / peak
+    max_dd = drawdown.max() * 100
+    max_dd_value = (peak - equity_series).max()
+
+    print("\n📈 RESULTADOS BACKTEST (V6)")
+    print("="*60)
+    print(f"Capital final: ${capital:,.2f}")
+    print(f"Rentabilidad total: {(capital/capital_inicial - 1)*100:.2f}%")
+    print(f"Número de trades: {num_trades}")
+    print(f"Trades ganadores: {ganadoras}/{num_trades} ({win_rate:.1f}%)")
+    print(f"Profit factor: {profit_factor:.2f}")
+    print(f"Sharpe Ratio (anualizado): {sharpe:.2f}")
+    print(f"Max Drawdown: {max_dd:.2f}% (${max_dd_value:,.2f})")
+    print(f"Max consecutive losses: {max_consecutive_losses}")
+    print(f"Expectancy por trade: ${expectancy:.2f}")
+    print(f"Expectancy / Riesgo: {expectancy_by_risk:.2f}")
+    if avg_loss != 0:
+        print(f"Risk/Reward: {abs(avg_win/avg_loss):.2f}")
+
+    # Gráficas (3 paneles)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    ax1.plot(df.index, df['Close'], label='Precio', color='black', linewidth=1)
+    ax1.plot(df.index, df['bb_upper'], label='Banda Superior', color='red', linestyle='--', alpha=0.7)
+    ax1.plot(df.index, df['bb_lower'], label='Banda Inferior', color='green', linestyle='--', alpha=0.7)
+    ax1.fill_between(df.index, df['bb_lower'], df['bb_upper'], alpha=0.1, color='gray')
+
+    compras = trades_df[trades_df['tipo'] == 'COMPRA']
+    ventas = trades_df[trades_df['tipo'].isin(['VENTA', 'CIERRE'])]
+    if not compras.empty:
+        ax1.scatter(compras['fecha'], compras['precio'], color='green', marker='^', s=100, label='Compra')
+    if not ventas.empty:
+        ax1.scatter(ventas['fecha'], ventas['precio'], color='red', marker='v', s=100, label='Venta')
+    ax1.set_ylabel('Precio ($)')
+    ax1.set_title(f'{symbol} - Estrategia Nivel Dios V6')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(df.index, df['CRSI'], label='CRSI', color='purple', linewidth=1)
+    ax2.axhline(y=70, color='red', linestyle='--', alpha=0.5, label='Sobrecompra (70)')
+    ax2.axhline(y=30, color='green', linestyle='--', alpha=0.5, label='Sobreventa (30)')
+    ax2.set_ylabel('CRSI')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    ax3.plot(df.index, df['hurst'], label='Hurst (ventana 30)', color='blue', linewidth=1)
+    ax3.axhline(y=hurst_thresh, color='red', linestyle='--', alpha=0.5, label=f'Umbral (H<{hurst_thresh})')
+    ax3.set_ylabel('Hurst')
+    ax3.set_xlabel('Fecha')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    return df, trades_df
+
+# ============================================
+# EJECUCIÓN
+# ============================================
+if __name__ == "__main__":
+    backtest(
+        symbol="TQQQ",
+        capital_inicial=100000,
+        risk_per_trade_base=0.01,       # 1% base
+        stop_atr_mult=2.0,
+        trailing_atr_mult_initial=1.5,
+        kill_switch_days=5,
+        kill_drop=0.10,
+        kill_vol=0.05,
+        hurst_thresh=0.5,
+        crsi_percentile=10,             # percentil más bajo (10%)
+        score_threshold=3,              # mínimo 3 puntos (ajustable)
+        use_partial_exit=True,
+        partial_pct=0.5,
+        max_exposure_pct=0.3,
+        min_distance_to_band=0.01,      # requiere 1% de distancia a la banda
+        cooldown_bars=3,
+        price_cluster_atr=0.5,
+        comision=0.001,
+        slippage=0.001,
+        debug=True
+    )
